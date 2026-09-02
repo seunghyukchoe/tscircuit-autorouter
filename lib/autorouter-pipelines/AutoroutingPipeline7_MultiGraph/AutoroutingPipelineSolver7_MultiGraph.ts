@@ -28,6 +28,7 @@ import {
   NodeWithPortPoints,
 } from "lib/types/high-density-types"
 import { applyNetColorsToGraphicsObject } from "lib/utils/applyNetColorsToGraphicsObject"
+import { assertValidAutorouterOutput } from "lib/validation/validate-autorouter-output"
 import { combineVisualizations } from "lib/utils/combineVisualizations"
 import {
   type TraceColorMode,
@@ -84,6 +85,11 @@ interface CapacityMeshSolverOptions {
   minNodeArea?: number
   visualizationTraceColorMode?: TraceColorMode
   powerTraceExpansion?: PowerTraceExpanderOptions
+  /**
+   * Opt in to fail-closed topology validation at the SRJ output and visualization boundary.
+   * This is not full DRC; v1 rejects jumper and through-obstacle route entries.
+   */
+  outputValidation?: "topology-v1"
 }
 export type AutoroutingPipelineSolverOptions = CapacityMeshSolverOptions
 
@@ -1192,9 +1198,16 @@ export class AutoroutingPipelineSolver7_MultiGraph extends BaseSolver {
   }
 
   getOutputSimpleRouteJson(): SimpleRouteJson {
-    return {
+    const outputSrj = {
       ...this.originalSrj,
       traces: this.getOutputSimplifiedPcbTraces(),
     }
+    if (this.opts.outputValidation === "topology-v1") {
+      assertValidAutorouterOutput({
+        inputSrj: this.originalSrj,
+        outputSrj,
+      })
+    }
+    return outputSrj
   }
 }
