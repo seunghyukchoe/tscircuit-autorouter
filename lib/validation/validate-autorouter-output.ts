@@ -1,4 +1,4 @@
-import { doSegmentsIntersect } from "@tscircuit/math-utils"
+import { doSegmentsIntersect, pointToBoxDistance } from "@tscircuit/math-utils"
 import type {
   ConnectionPoint,
   Obstacle,
@@ -7,6 +7,7 @@ import type {
 } from "../types/srj-types"
 import { mapLayerNameToZ } from "../utils/mapLayerNameToZ"
 import { mapZToLayerName } from "../utils/mapZToLayerName"
+import { getViaDimensions } from "../utils/getViaDimensions"
 
 export type AutorouterOutputDiagnosticCode =
   | "UNKNOWN_CONNECTION"
@@ -15,6 +16,7 @@ export type AutorouterOutputDiagnosticCode =
   | "NON_FINITE_COORDINATE"
   | "DIFFERENT_CONNECTION_SAME_LAYER_CROSSING"
   | "DISCONNECTED_ROUTE_ENDPOINT"
+  | "VIA_OBSTACLE_CLEARANCE"
 
 export interface AutorouterOutputDiagnostic {
   readonly code: AutorouterOutputDiagnosticCode
@@ -26,6 +28,9 @@ export interface AutorouterOutputDiagnostic {
   readonly segmentIndex?: number
   readonly peerSegmentIndex?: number
   readonly coordinate?: Readonly<{ x: number; y: number }>
+  readonly obstacleId?: string
+  readonly actualClearance?: number
+  readonly minimumClearance?: number
 }
 
 export interface AutorouterOutputValidationResult {
@@ -36,6 +41,7 @@ export interface AutorouterOutputValidationResult {
 export interface ValidateAutorouterOutputInput {
   inputSrj: SimpleRouteJson
   outputSrj: SimpleRouteJson
+  minimumObstacleClearance?: number
 }
 
 export class AutorouterOutputValidationError extends Error {
@@ -64,6 +70,7 @@ type WireSegment = Readonly<{
 type ViaPoint = Readonly<{
   point: Point
   layers: readonly string[]
+  diameter: number
   routeIndex: number
 }>
 type ConnectedObstacle = Readonly<{ owner: string; obstacle: Obstacle }>
@@ -308,6 +315,24 @@ const pointTouchesConnectedObstacle = (
   )
 }
 
+const pointToRotatedObstacleDistance = (
+  point: Point,
+  obstacle: Obstacle,
+): number => {
+  const rotationRadians = ((obstacle.ccwRotationDegrees ?? 0) * Math.PI) / 180
+  const deltaX = point.x - obstacle.center.x
+  const deltaY = point.y - obstacle.center.y
+  const localPoint = {
+    x: deltaX * Math.cos(rotationRadians) + deltaY * Math.sin(rotationRadians),
+    y: -deltaX * Math.sin(rotationRadians) + deltaY * Math.cos(rotationRadians),
+  }
+  return pointToBoxDistance(localPoint, {
+    center: { x: 0, y: 0 },
+    width: obstacle.width,
+    height: obstacle.height,
+  })
+}
+
 const traceTouchesConnectedObstacle = (
   trace: PreparedTrace,
   connectedObstacle: ConnectedObstacle,
@@ -363,16 +388,23 @@ const freezeResult = (
  * Validates the topology of the complete returned SRJ trace set.
  *
  * This pure v1 helper validates every returned entry for route shape, declared layers, endpoint
- * connectivity, and different-connection same-layer crossings. Wire and via topology is modeled;
- * jumper and through-obstacle entries fail closed instead of being omitted. This deliberately does
- * not claim trace clearance, physical pad-shape validation, pad clearance, via clearance,
- * via-in-pad validity, or complete DRC. Declared rectangular obstacles are used only as connected
- * endpoint regions.
+ * connectivity and different-connection same-layer crossings. When minimumObstacleClearance is
+ * provided, it also validates circular via copper clearance from foreign connected rectangular SRJ
+ * obstacles and honors obstacle rotation. Wire and via topology is modeled; jumper and
+ * through-obstacle entries fail closed instead of being omitted. This does not claim physical
+ * pad-shape validation, wire clearance, via-to-via clearance, or complete DRC.
  */
 const validateAutorouterOutputWithinBudget = ({
   inputSrj,
   outputSrj,
+  minimumObstacleClearance,
 }: ValidateAutorouterOutputInput): AutorouterOutputValidationResult => {
+  if (
+    minimumObstacleClearance !== undefined &&
+    (!Number.isFinite(minimumObstacleClearance) || minimumObstacleClearance < 0)
+  ) {
+    throw new RangeError("minimumObstacleClearance must be finite and non-negative")
+  }
   const connectionPointCount = inputSrj.connections.reduce(
     (count, connection) => count + connection.pointsToConnect.length,
     0,
@@ -820,6 +852,21 @@ const validateAutorouterOutputWithinBudget = ({
           shapeValid = false
           continue
         }
+        const viaDiameter =
+          typeof routeItem.via_diameter === "number"
+            ? routeItem.via_diameter
+            : getViaDimensions(inputSrj).padDiameter
+        if (!Number.isFinite(viaDiameter) || viaDiameter <= 0) {
+          pushDiagnostic({
+            code: "INVALID_SEGMENT",
+            connectionName,
+            traceId,
+            segmentIndex: routeIndex,
+          })
+          locatedItems.push(null)
+          shapeValid = false
+          continue
+        }
         const fromLayer = routeItem.from_layer
         const toLayer = routeItem.to_layer
         if (
@@ -859,6 +906,7 @@ const validateAutorouterOutputWithinBudget = ({
         const via: ViaPoint = {
           point: { x: routeItem.x, y: routeItem.y },
           layers: layersTraversedByVia(fromLayer, toLayer, inputSrj.layerCount),
+          diameter: viaDiameter,
           routeIndex,
         }
         vias.push(via)
@@ -1099,6 +1147,51 @@ const validateAutorouterOutputWithinBudget = ({
             coordinate: leftVia.point,
           })
         }
+      }
+    }
+  }
+
+  for (const trace of preparedTraces) {
+    if (
+      minimumObstacleClearance === undefined ||
+      !trace.shapeValid ||
+      trace.owner === null
+    ) {
+      continue
+    }
+    for (const via of trace.vias) {
+      for (const connectedObstacle of connectedObstacles) {
+        consumeWork()
+        if (
+          connectedObstacle.owner === trace.owner ||
+          !connectedObstacle.obstacle.layers.some((layer) =>
+            via.layers.includes(layer),
+          )
+        ) {
+          continue
+        }
+        const actualClearance =
+          pointToRotatedObstacleDistance(
+            via.point,
+            connectedObstacle.obstacle,
+          ) -
+          via.diameter / 2
+        if (actualClearance + POINT_EPSILON >= minimumObstacleClearance) {
+          continue
+        }
+        pushDiagnostic({
+          code: "VIA_OBSTACLE_CLEARANCE",
+          connectionName: trace.connectionName,
+          traceId: trace.traceId,
+          layer: connectedObstacle.obstacle.layers.find((layer) =>
+            via.layers.includes(layer),
+          ),
+          segmentIndex: via.routeIndex,
+          coordinate: via.point,
+          obstacleId: connectedObstacle.obstacle.obstacleId,
+          actualClearance,
+          minimumClearance: minimumObstacleClearance,
+        })
       }
     }
   }
